@@ -30,6 +30,7 @@ from llama_attn_replace_sft import replace_llama_attn
 from gptneox_attn_replace import replace_gpt_neox_attn
 from peft import LoraConfig, get_peft_model
 from torch.distributed import barrier
+import datasets
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -37,10 +38,15 @@ DEFAULT_EOS_TOKEN = "</s>"
 DEFAULT_BOS_TOKEN = "<s>"
 DEFAULT_UNK_TOKEN = "<unk>"
 
+B_INST, E_INST = "[INST]", "[/INST]"
+B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
+
+
 def _make_r_io_base(f, mode: str):
     if not isinstance(f, io.IOBase):
         f = open(f, mode=mode)
     return f
+
 
 def jload(f, mode="r"):
     """Load a .json file into a dictionary."""
@@ -49,41 +55,28 @@ def jload(f, mode="r"):
     f.close()
     return jdict
 
+
 PROMPT_DICT = {
-    "prompt_input": (
-        "Below is an instruction that describes a task, paired with an input that provides further context. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
+    "prompt_designer": (
+        f"<s>{B_INST} {B_SYS}Provided series of PromQL queries for several Grafana panels, generate a full Grafana dashboard.{E_SYS}```json\n{{designer_input}}\n```\n{E_INST}\n"
     ),
-    "prompt_no_input": (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Response:"
-    ),
-    "prompt_no_input_llama2":(
-        "<s>[INST] <<SYS>>\n"
-        "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\n"
-        "If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.\n"
-        "<</SYS>> \n\n {instruction} [/INST]"
-    ),
-    "prompt_input_llama2": (
-        "<s>[INST] <<SYS>>\n"
-        "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\n"
-        "If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.\n"
-        "<</SYS>> \n\n {instruction} \n{input} [/INST]"
+    "prompt_alchemist": (
+        f"<s>{B_INST} {B_SYS}Using the supplied Grafana dashboard graphs/panels in JSON – encompassing title, type, description, and associated metrics – and optionally the header of its associated group and a general dashboard summary, generate valid PromQL query.{E_SYS}```json\n{{alchemist_input}}\n```\n{E_INST}\n"
     )
 }
 
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: Optional[str] = field(default="EleutherAI/pythia-1.4b-deduped")
+    model_name_or_path: Optional[str] = field(
+        default="EleutherAI/pythia-1.4b-deduped")
     model_type: Optional[str] = field(default="llama")
 
 
 @dataclass
 class DataArguments:
-    data_path: str = field(default=None, metadata={"help": "Path to the training data."})
+    data_path: str = field(default=None, metadata={
+                           "help": "Path to the training data."})
 
 
 @dataclass
@@ -92,7 +85,8 @@ class TrainingArguments(transformers.TrainingArguments):
     optim: str = field(default="adamw_torch")
     model_max_length: int = field(
         default=8192 * 4,
-        metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
+        metadata={
+            "help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
     use_flash_attn: bool = field(
         default=True,
@@ -108,8 +102,10 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     trainable_params: str = field(
         default="embed,norm",
-        metadata={"help": "Additional trainable parameters except LoRA weights, if low rank training."},
+        metadata={
+            "help": "Additional trainable parameters except LoRA weights, if low rank training."},
     )
+
 
 def smart_tokenizer_and_embedding_resize(
     special_tokens_dict: Dict,
@@ -127,8 +123,10 @@ def smart_tokenizer_and_embedding_resize(
         input_embeddings = model.get_input_embeddings().weight.data
         output_embeddings = model.get_output_embeddings().weight.data
 
-        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
-        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+        input_embeddings_avg = input_embeddings[:-
+                                                num_new_tokens].mean(dim=0, keepdim=True)
+        output_embeddings_avg = output_embeddings[:-
+                                                  num_new_tokens].mean(dim=0, keepdim=True)
 
         input_embeddings[-num_new_tokens:] = input_embeddings_avg
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
@@ -146,7 +144,8 @@ def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedToken
         )
         for text in strings
     ]
-    input_ids = labels = [tokenized.input_ids[0] for tokenized in tokenized_list]
+    input_ids = labels = [tokenized.input_ids[0]
+                          for tokenized in tokenized_list]
     input_ids_lens = labels_lens = [
         tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item() for tokenized in tokenized_list
     ]
@@ -165,7 +164,8 @@ def preprocess(
 ) -> Dict:
     """Preprocess the data by tokenizing."""
     examples = [s + t for s, t in zip(sources, targets)]
-    examples_tokenized, sources_tokenized = [_tokenize_fn(strings, tokenizer) for strings in (examples, sources)]
+    examples_tokenized, sources_tokenized = [_tokenize_fn(
+        strings, tokenizer) for strings in (examples, sources)]
     input_ids = examples_tokenized["input_ids"]
     labels = copy.deepcopy(input_ids)
     for label, source_len in zip(labels, sources_tokenized["input_ids_lens"]):
@@ -176,20 +176,23 @@ def preprocess(
 class SupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer):
+    def __init__(self, type: str, tokenizer: transformers.PreTrainedTokenizer):
         super(SupervisedDataset, self).__init__()
         logging.warning("Loading data...")
-        list_data_dict = jload(data_path)
+        dataset = datasets.load_dataset("kiamesdavies/prometheus-grafana-dashboards-full-v3",
+                                        split="train")
 
         logging.warning("Formatting inputs...")
 
-        prompt_input, prompt_no_input = PROMPT_DICT["prompt_input_llama2"], PROMPT_DICT["prompt_no_input_llama2"]
-        sources = [
-            prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
-            for example in list_data_dict
-        ]
-        
-        targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
+        prompt_template = PROMPT_DICT["prompt_designer"] if type == "designer" else PROMPT_DICT["prompt_alchemist"]
+        output_template = f"[RESULT]```json\n{{designer_output}}\n```[/RESULT]{tokenizer.eos_token}" if type == "designer" else f"[RESULT]```json\n{{alchemist_input}}\n```[/RESULT]{tokenizer.eos_token}"
+
+        sources = []
+        targets = []
+
+        for example in dataset:
+            sources.append(prompt_template.format_map(example))
+            targets.append(output_template.format_map(example))
 
         logging.warning("Tokenizing inputs... This may take some time...")
         data_dict = preprocess(sources, targets, tokenizer)
@@ -211,11 +214,13 @@ class DataCollatorForSupervisedDataset(object):
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
+        input_ids, labels = tuple(
+            [instance[key] for instance in instances] for key in ("input_ids", "labels"))
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
-        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        labels = torch.nn.utils.rnn.pad_sequence(
+            labels, batch_first=True, padding_value=IGNORE_INDEX)
         return dict(
             input_ids=input_ids,
             labels=labels,
@@ -225,20 +230,24 @@ class DataCollatorForSupervisedDataset(object):
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path)
+    train_dataset = SupervisedDataset(
+        tokenizer=tokenizer, data_path=data_args.data_path)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
 
 def train():
-    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+    parser = transformers.HfArgumentParser(
+        (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     # NOTE: May expand supported model types in the future
     if model_args.model_type == "gpt-neox":
-        replace_gpt_neox_attn(training_args.use_flash_attn, training_args.use_full_attn) 
+        replace_gpt_neox_attn(training_args.use_flash_attn,
+                              training_args.use_full_attn)
     else:
-        replace_llama_attn(training_args.use_flash_attn, training_args.use_full_attn)
+        replace_llama_attn(training_args.use_flash_attn,
+                           training_args.use_full_attn)
 
     # Set RoPE scaling factor
     config = transformers.AutoConfig.from_pretrained(
@@ -248,7 +257,8 @@ def train():
 
     orig_ctx_len = getattr(config, "max_position_embeddings", None)
     if orig_ctx_len and training_args.model_max_length > orig_ctx_len:
-        scaling_factor = float(math.ceil(training_args.model_max_length / orig_ctx_len))
+        scaling_factor = float(
+            math.ceil(training_args.model_max_length / orig_ctx_len))
         config.rope_scaling = {"type": "linear", "factor": scaling_factor}
 
     # Load model and tokenizer
@@ -283,18 +293,19 @@ def train():
         model=model,
     )
 
-    data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    data_module = make_supervised_data_module(
+        tokenizer=tokenizer, data_args=data_args)
 
     if training_args.low_rank_training:
         if model_args.model_type == "gpt-neox":
             # added `dense` to match with llama as the basic LoRA would only target 'query_key_value'
             targets = ["query_key_value", "dense"]
         else:
-            targets=["q_proj", "k_proj", "v_proj", "o_proj"]
+            targets = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
         config = LoraConfig(
-            r=8,
-            lora_alpha=16,
+            r=256,
+            lora_alpha=512,
             target_modules=targets,
             lora_dropout=0,
             bias="none",
@@ -302,13 +313,15 @@ def train():
         )
         model = get_peft_model(model, config)
         # enable trainable params
-        [p.requires_grad_() for n, p in model.named_parameters() if any([k in n for k in training_args.trainable_params.split(",")])]
+        [p.requires_grad_() for n, p in model.named_parameters() if any(
+            [k in n for k in training_args.trainable_params.split(",")])]
 
     model.config.use_cache = False         # required for gradient checkpointing
     model.enable_input_require_grads()     # required for gradient checkpointing
     model.gradient_checkpointing_enable()  # enable gradient checkpointing
 
-    trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    trainer = Trainer(model=model, tokenizer=tokenizer,
+                      args=training_args, **data_module)
     trainer.train()
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
