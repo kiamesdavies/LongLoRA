@@ -178,7 +178,7 @@ class SupervisedDataset(Dataset):
 
     def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer):
         super(SupervisedDataset, self).__init__()
-        logging.warning("Loading data...")
+        logging.warning("Loading {data_path=}...")
         dataset = datasets.load_dataset("kiamesdavies/prometheus-grafana-dashboards-full-v3",
                                         split="train")
 
@@ -186,7 +186,7 @@ class SupervisedDataset(Dataset):
 
         prompt_template = PROMPT_DICT["prompt_designer"] if data_path == "designer" else PROMPT_DICT["prompt_alchemist"]
         output_template = f"[RESULT]```json\n{{designer_output}}\n```[/RESULT]{tokenizer.eos_token}" if data_path == "designer" else f"[RESULT]```json\n{{alchemist_input}}\n```[/RESULT]{tokenizer.eos_token}"
-
+        print(f"Using {prompt_template=} \n  {output_template=}")
         sources = []
         targets = []
 
