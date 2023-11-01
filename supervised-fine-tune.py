@@ -83,6 +83,7 @@ class DataArguments:
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
+    report_to: str = field(default="wandb")
     model_max_length: int = field(
         default=8192 * 4,
         metadata={
@@ -304,8 +305,8 @@ def train():
             targets = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
         config = LoraConfig(
-            r=256,
-            lora_alpha=512,
+            r=8,
+            lora_alpha=16,
             target_modules=targets,
             lora_dropout=0,
             bias="none",
