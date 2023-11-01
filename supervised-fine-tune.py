@@ -176,7 +176,7 @@ def preprocess(
 class SupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, type: str, tokenizer: transformers.PreTrainedTokenizer):
+    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer):
         super(SupervisedDataset, self).__init__()
         logging.warning("Loading data...")
         dataset = datasets.load_dataset("kiamesdavies/prometheus-grafana-dashboards-full-v3",
@@ -184,8 +184,8 @@ class SupervisedDataset(Dataset):
 
         logging.warning("Formatting inputs...")
 
-        prompt_template = PROMPT_DICT["prompt_designer"] if type == "designer" else PROMPT_DICT["prompt_alchemist"]
-        output_template = f"[RESULT]```json\n{{designer_output}}\n```[/RESULT]{tokenizer.eos_token}" if type == "designer" else f"[RESULT]```json\n{{alchemist_input}}\n```[/RESULT]{tokenizer.eos_token}"
+        prompt_template = PROMPT_DICT["prompt_designer"] if data_path == "designer" else PROMPT_DICT["prompt_alchemist"]
+        output_template = f"[RESULT]```json\n{{designer_output}}\n```[/RESULT]{tokenizer.eos_token}" if data_path == "designer" else f"[RESULT]```json\n{{alchemist_input}}\n```[/RESULT]{tokenizer.eos_token}"
 
         sources = []
         targets = []
