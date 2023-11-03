@@ -16,3 +16,4 @@ gradio
 einops
 bitsandbytes
 scipy
+tqdm

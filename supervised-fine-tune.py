@@ -32,6 +32,8 @@ from peft import LoraConfig, get_peft_model
 from torch.distributed import barrier
 import datasets
 
+from concatenator import ConcatDataset
+
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
 DEFAULT_EOS_TOKEN = "</s>"
@@ -58,10 +60,10 @@ def jload(f, mode="r"):
 
 PROMPT_DICT = {
     "prompt_designer": (
-        f"<s>{B_INST} {B_SYS}Provided series of PromQL queries for several Grafana panels, generate a full Grafana dashboard.{E_SYS}```json\n{{designer_input}}\n```\n{E_INST}\n"
+        f"{B_INST} {B_SYS}Provided series of PromQL queries for several Grafana panels, generate a full Grafana dashboard.{E_SYS}```json\n{{designer_input}}\n```\n{E_INST}\n"
     ),
     "prompt_alchemist": (
-        f"<s>{B_INST} {B_SYS}Using the supplied Grafana dashboard graphs/panels in JSON – encompassing title, type, description, and associated metrics – and optionally the header of its associated group and a general dashboard summary, generate valid PromQL query.{E_SYS}```json\n{{alchemist_input}}\n```\n{E_INST}\n"
+        f"{B_INST} {B_SYS}Using the supplied Grafana dashboard graphs/panels in JSON – encompassing title, type, description, and associated metrics – and optionally the header of its associated group and a general dashboard summary, generate valid PromQL query.{E_SYS}```json\n{{alchemist_input}}\n```\n{E_INST}\n"
     )
 }
 
@@ -107,134 +109,50 @@ class TrainingArguments(transformers.TrainingArguments):
             "help": "Additional trainable parameters except LoRA weights, if low rank training."},
     )
 
+def get_custom_dataset(tokenizer, split, data_path: str):
+    dataset = datasets.load_dataset("kiamesdavies/prometheus-grafana-dashboards-full-v3",
+                                    split=split)
 
-def smart_tokenizer_and_embedding_resize(
-    special_tokens_dict: Dict,
-    tokenizer: transformers.PreTrainedTokenizer,
-    model: transformers.PreTrainedModel,
-):
-    """Resize tokenizer and embedding.
+    prompt_template = PROMPT_DICT["prompt_designer"] if data_path == "designer" else PROMPT_DICT["prompt_alchemist"]
+    output_template = f"[RESULT]```json\n{{designer_output}}\n```[/RESULT]" if data_path == "designer" else f"[RESULT]```json\n{{alchemist_input}}\n```[/RESULT]"
 
-    Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
-    """
-    num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
-    model.resize_token_embeddings(len(tokenizer))
+    def apply_prompt_template(sample):
+        return {
+            "prompt": prompt_template.format(**sample),
+            "output": output_template.format(**sample),
+        }
 
-    if num_new_tokens > 0:
-        input_embeddings = model.get_input_embeddings().weight.data
-        output_embeddings = model.get_output_embeddings().weight.data
+    dataset = dataset.map(apply_prompt_template,
+                          remove_columns=list(dataset.features))
 
-        input_embeddings_avg = input_embeddings[:-
-                                                num_new_tokens].mean(dim=0, keepdim=True)
-        output_embeddings_avg = output_embeddings[:-
-                                                  num_new_tokens].mean(dim=0, keepdim=True)
+    def tokenize_add_label(sample):
+        prompt = tokenizer.encode(
+            tokenizer.bos_token + sample["prompt"], add_special_tokens=False)
+        summary = tokenizer.encode(
+            sample["output"] + tokenizer.eos_token, add_special_tokens=False)
 
-        input_embeddings[-num_new_tokens:] = input_embeddings_avg
-        output_embeddings[-num_new_tokens:] = output_embeddings_avg
+        sample = {
+            "input_ids": prompt + summary,
+            "attention_mask": [1] * (len(prompt) + len(summary)),
+            "labels": [-100] * len(prompt) + summary,
+        }
 
+        return sample
 
-def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer) -> Dict:
-    """Tokenize a list of strings."""
-    tokenized_list = [
-        tokenizer(
-            text,
-            return_tensors="pt",
-            padding="longest",
-            max_length=tokenizer.model_max_length,
-            truncation=True,
-        )
-        for text in strings
-    ]
-    input_ids = labels = [tokenized.input_ids[0]
-                          for tokenized in tokenized_list]
-    input_ids_lens = labels_lens = [
-        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item() for tokenized in tokenized_list
-    ]
-    return dict(
-        input_ids=input_ids,
-        labels=labels,
-        input_ids_lens=input_ids_lens,
-        labels_lens=labels_lens,
-    )
+    dataset = dataset.map(tokenize_add_label,
+                          remove_columns=list(dataset.features))
+
+    return dataset
 
 
-def preprocess(
-    sources: Sequence[str],
-    targets: Sequence[str],
-    tokenizer: transformers.PreTrainedTokenizer,
-) -> Dict:
-    """Preprocess the data by tokenizing."""
-    examples = [s + t for s, t in zip(sources, targets)]
-    examples_tokenized, sources_tokenized = [_tokenize_fn(
-        strings, tokenizer) for strings in (examples, sources)]
-    input_ids = examples_tokenized["input_ids"]
-    labels = copy.deepcopy(input_ids)
-    for label, source_len in zip(labels, sources_tokenized["input_ids_lens"]):
-        label[:source_len] = IGNORE_INDEX
-    return dict(input_ids=input_ids, labels=labels)
-
-
-class SupervisedDataset(Dataset):
-    """Dataset for supervised fine-tuning."""
-
-    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer):
-        super(SupervisedDataset, self).__init__()
-        logging.warning("Loading {data_path=}...")
-        dataset = datasets.load_dataset("kiamesdavies/prometheus-grafana-dashboards-full-v3",
-                                        split="train")
-
-        logging.warning("Formatting inputs...")
-
-        prompt_template = PROMPT_DICT["prompt_designer"] if data_path == "designer" else PROMPT_DICT["prompt_alchemist"]
-        output_template = f"[RESULT]```json\n{{designer_output}}\n```[/RESULT]{tokenizer.eos_token}" if data_path == "designer" else f"[RESULT]```json\n{{alchemist_input}}\n```[/RESULT]{tokenizer.eos_token}"
-        print(f"Using {prompt_template=} \n  {output_template=}")
-        sources = []
-        targets = []
-
-        for example in dataset:
-            sources.append(prompt_template.format_map(example))
-            targets.append(output_template.format_map(example))
-
-        logging.warning("Tokenizing inputs... This may take some time...")
-        data_dict = preprocess(sources, targets, tokenizer)
-
-        self.input_ids = data_dict["input_ids"]
-        self.labels = data_dict["labels"]
-
-    def __len__(self):
-        return len(self.input_ids)
-
-    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        return dict(input_ids=self.input_ids[i], labels=self.labels[i])
-
-
-@dataclass
-class DataCollatorForSupervisedDataset(object):
-    """Collate examples for supervised fine-tuning."""
-
-    tokenizer: transformers.PreTrainedTokenizer
-
-    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple(
-            [instance[key] for instance in instances] for key in ("input_ids", "labels"))
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
-        )
-        labels = torch.nn.utils.rnn.pad_sequence(
-            labels, batch_first=True, padding_value=IGNORE_INDEX)
-        return dict(
-            input_ids=input_ids,
-            labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
-        )
-
-
-def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
+def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, training_args, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = SupervisedDataset(
-        tokenizer=tokenizer, data_path=data_args.data_path)
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    dataset_train = get_custom_dataset(
+        data_path=data_args.data_path, tokenizer=tokenizer, split="train")
+    dataset_eval = get_custom_dataset(
+        data_path=data_args.data_path, tokenizer=tokenizer, split="test")
+
+    return dict(train_dataset=ConcatDataset(dataset_train, chunk_size=training_args.model_max_length), eval_dataset=dataset_eval)
 
 
 def train():
@@ -277,25 +195,11 @@ def train():
         padding_side="right",
         use_fast=True,
     )
+    tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    special_tokens_dict = dict()
-    if tokenizer.pad_token is None:
-        special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
-    if tokenizer.eos_token is None:
-        special_tokens_dict["eos_token"] = DEFAULT_EOS_TOKEN
-    if tokenizer.bos_token is None:
-        special_tokens_dict["bos_token"] = DEFAULT_BOS_TOKEN
-    if tokenizer.unk_token is None:
-        special_tokens_dict["unk_token"] = DEFAULT_UNK_TOKEN
-
-    smart_tokenizer_and_embedding_resize(
-        special_tokens_dict=special_tokens_dict,
-        tokenizer=tokenizer,
-        model=model,
-    )
 
     data_module = make_supervised_data_module(
-        tokenizer=tokenizer, data_args=data_args)
+        tokenizer=tokenizer, training_args=training_args, data_args=data_args)
 
     if training_args.low_rank_training:
         if model_args.model_type == "gpt-neox":
